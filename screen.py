@@ -1,19 +1,17 @@
 """
-MLB Daily Screen (v2) — no FanGraphs dependency.
+MLB Daily Screen (v3) — no FanGraphs dependency.
 
 Data sources (all accessible from cloud / GitHub Actions IPs):
   - statsapi.mlb.com         : schedule, probable pitchers, per-pitcher season stats
-  - baseballsavant.mlb.com   : expected stats (xwOBA, wOBA, xERA) for the regression engine
-  - The Odds API             : moneyline + totals (needs ODDS_API_KEY secret)
+  - Baseball Savant via pybaseball.statcast_pitcher_expected_stats : xwOBA / wOBA (regression engine)
+  - The Odds API             : moneyline (needs ODDS_API_KEY secret)
   - Open-Meteo               : weather by stadium
 
 Writes reports/YYYY-MM-DD.md
 """
 from __future__ import annotations
 import os
-import io
 import sys
-import csv
 import math
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,7 +25,7 @@ TODAY = NOW.strftime("%Y-%m-%d")
 YEAR = NOW.year
 REPORTS_DIR = Path("reports")
 REPORTS_DIR.mkdir(exist_ok=True)
-UA = {"User-Agent": "Mozilla/5.0 (compatible; mlb-screen/2.0)"}
+UA = {"User-Agent": "Mozilla/5.0 (compatible; mlb-screen/3.0)"}
 
 VENUE_COORDS: dict[str, tuple[float, float]] = {
     "Yankee Stadium": (40.8296, -73.9262), "Fenway Park": (42.3467, -71.0972),
@@ -55,13 +53,6 @@ def safe_float(v, default=float("nan")):
         return float(v)
     except (TypeError, ValueError):
         return default
-
-
-def american_to_implied(odds):
-    o = safe_float(odds)
-    if math.isnan(o):
-        return None
-    return (-o / (-o + 100)) if o < 0 else (100 / (o + 100))
 
 
 # ---------------------------------------------------------------------------
@@ -125,27 +116,22 @@ def fetch_pitcher_season(pid) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Baseball Savant — expected stats (the regression engine)
+# Baseball Savant — expected stats via pybaseball (regression engine)
 # ---------------------------------------------------------------------------
 def fetch_savant_expected() -> dict[str, dict]:
-    url = "https://baseballsavant.mlb.com/leaderboard/expected_statistics"
-    params = {"type": "pitcher", "year": YEAR, "min": "1", "csv": "true"}
+    """Returns {player_id(str): {woba, xwoba}} from Savant expected stats."""
     out: dict[str, dict] = {}
     try:
-        r = requests.get(url, params=params, headers=UA, timeout=30)
-        r.raise_for_status()
-        reader = csv.DictReader(io.StringIO(r.text))
-        for row in reader:
-            pid = (row.get("player_id") or "").strip()
-            if not pid:
+        from pybaseball import statcast_pitcher_expected_stats
+        df = statcast_pitcher_expected_stats(YEAR, 1)  # minPA=1 -> everyone
+        print(f"[savant] columns: {list(df.columns)}", file=sys.stderr)
+        for _, row in df.iterrows():
+            pid = str(row.get("player_id", "")).strip()
+            if not pid or pid.lower() == "nan":
                 continue
             out[pid] = {
                 "woba": safe_float(row.get("woba")),
                 "xwoba": safe_float(row.get("est_woba")),
-                "era": safe_float(row.get("era")),
-                "xera": safe_float(row.get("xera")),
-                "ba": safe_float(row.get("ba")),
-                "xba": safe_float(row.get("est_ba")),
             }
     except Exception as e:
         print(f"[savant] failed: {e}", file=sys.stderr)
@@ -161,7 +147,6 @@ def build_pitcher(pid, name, savant) -> dict | None:
     base["Name"] = name or "?"
     base["xwoba"] = sv.get("xwoba", float("nan"))
     base["woba"] = sv.get("woba", float("nan"))
-    base["xera"] = sv.get("xera", float("nan"))
     return base
 
 
@@ -172,7 +157,7 @@ def fetch_odds() -> dict[str, dict]:
     if not ODDS_API_KEY:
         return {}
     url = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
-    params = {"apiKey": ODDS_API_KEY, "regions": "us", "markets": "h2h,totals",
+    params = {"apiKey": ODDS_API_KEY, "regions": "us", "markets": "h2h",
               "oddsFormat": "american", "bookmakers": "fanduel,draftkings"}
     try:
         r = requests.get(url, params=params, timeout=20)
@@ -264,7 +249,7 @@ def pline(p, label) -> str:
     def f(x, n=2):
         return "n/d" if (isinstance(x, float) and math.isnan(x)) else f"{x:.{n}f}"
     return (f"- **{label}** {p.get('Name','?')} ({p.get('GS','?')} GS): "
-            f"ERA {f(p.get('ERA'))} · xERA {f(p.get('xera'))} · WHIP {f(p.get('WHIP'))} · "
+            f"ERA {f(p.get('ERA'))} · WHIP {f(p.get('WHIP'))} · "
             f"K-BB% {f(p.get('KBB_pct'),1)} · wOBA {f(p.get('woba'),3)} · xwOBA {f(p.get('xwoba'),3)}")
 
 
@@ -273,8 +258,7 @@ def build_report(screens) -> str:
          f"**Juegos:** {len(screens)} · "
          f"**Eliminados:** {sum(1 for s in screens if s['eliminations'])} · "
          f"**Con flags:** {sum(1 for s in screens if s['flags'] and not s['eliminations'])}",
-         "", "_Motor de regresión: wOBA real vs xwOBA esperado (Statcast). "
-         "Sin SIERA/xFIP porque FanGraphs bloquea IPs de nube._", "", "---", ""]
+         "", "_Motor de regresión: wOBA real vs xwOBA esperado (Statcast vía pybaseball)._", "", "---", ""]
 
     elim = [s for s in screens if s["eliminations"]]
     if elim:
