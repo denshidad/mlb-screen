@@ -1,0 +1,38 @@
+name: Daily MLB Screen
+
+on:
+  schedule:
+    # 14:00 UTC = 10:00 AM ET (ajusta si quieres otra hora)
+    - cron: '0 14 * * *'
+  workflow_dispatch:  # permite disparo manual desde GitHub mobile
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run screen
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: python screen.py
+
+      - name: Commit report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reports/
+          git diff --cached --quiet || git commit -m "Screen $(date -u +%Y-%m-%d)"
+          git push
