@@ -71,7 +71,7 @@ def safe_float(v, default=float("nan")):
 
 def implied(odds):
     o = safe_float(odds)
-    if math.isnan(o):
+    if math.isnan(o) or -100 < o < 100:  # invalid American odds (e.g. 0, -10) -> reject
         return None
     return (-o / (-o + 100)) if o < 0 else (100 / (o + 100))
 
@@ -242,27 +242,36 @@ def fetch_strikeout_props(event_id) -> dict[str, dict]:
     except Exception as e:
         print(f"[props] event {event_id} failed: {e}", file=sys.stderr)
         return {}
-    agg: dict[str, dict] = {}
+    agg: dict = {}  # (name, point) -> {"over": [...], "under": [...]}
     for book in r.json().get("bookmakers", []):
         for m in book.get("markets", []):
             if m.get("key") != "pitcher_strikeouts":
                 continue
             for o in m.get("outcomes", []):
                 name = o.get("description") or o.get("name")
+                point = o.get("point")
                 side = o.get("name")
-                d = agg.setdefault(name, {"line": o.get("point"), "over": [], "under": []})
+                price = o.get("price")
+                # reject impossible American odds (the -10 bug)
+                if price is None or -100 < price < 100:
+                    continue
+                d = agg.setdefault((name, point), {"over": [], "under": []})
                 if side == "Over":
-                    d["over"].append(o["price"])
+                    d["over"].append(price)
                 elif side == "Under":
-                    d["under"].append(o["price"])
-    out = {}
-    for name, d in agg.items():
-        out[name] = {
-            "line": d["line"],
+                    d["under"].append(price)
+    # For each pitcher keep ONLY the best-covered single line (never blend across lines)
+    best: dict = {}  # name -> (coverage, {line, over, under})
+    for (name, point), d in agg.items():
+        cov = len(d["over"]) + len(d["under"])
+        entry = {
+            "line": point,
             "over": round(sum(d["over"]) / len(d["over"])) if d["over"] else None,
             "under": round(sum(d["under"]) / len(d["under"])) if d["under"] else None,
         }
-    return out
+        if name not in best or cov > best[name][0]:
+            best[name] = (cov, entry)
+    return {name: v[1] for name, v in best.items()}
 
 
 def update_snapshots(odds) -> tuple[dict, int]:
