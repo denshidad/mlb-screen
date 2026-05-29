@@ -1,21 +1,18 @@
 """
-MLB Daily Screen (v5) — adds a transparent win-probability model + auto edge.
+MLB Daily Screen (v6) — adds pitcher-strikeout props for elite-K starters.
 
 Pipeline:
   1. Schedule + probable pitchers + per-pitcher stats : statsapi.mlb.com
   2. Expected stats (xwOBA / wOBA)                     : Baseball Savant (pybaseball)
   3. Standings (team strength)                         : statsapi.mlb.com
-  4. Moneylines + line-movement snapshots              : The Odds API
-  5. Weather                                           : Open-Meteo
+  4. Moneylines + line-movement snapshots              : The Odds API (/odds)
+  5. Pitcher strikeouts (elite-K starters only)        : The Odds API (/events/{id}/odds)
+  6. Weather                                           : Open-Meteo
 
-Model: log5(team win% regressed to .500) + home-field + starter xwOBA edge.
-Edge  = model prob  -  de-vigged market prob.  Flag if >= +3%.
+Quota-safe: props are pulled ONLY on the evening run (NOW.hour >= 21) and ONLY
+for starters with K-BB% >= ELITE_KBB, so the free 500/month tier suffices.
 
-HONEST NOTE: the MLB market is very efficient. Small edges (3-6%) are the
-actionable zone; treat edges > 8% with suspicion (the model is likely missing
-info the market has: injuries, bullpen, lineup). Calibrate against your CLV log.
-
-Writes reports/YYYY-MM-DD.md ; snapshots in snapshots/YYYY-MM-DD.json
+Markets evaluated with an edge number: moneyline (model) + pitcher Ks (Poisson).
 """
 from __future__ import annotations
 import os
@@ -34,12 +31,15 @@ TODAY = NOW.strftime("%Y-%m-%d")
 YEAR = NOW.year
 REPORTS_DIR = Path("reports"); REPORTS_DIR.mkdir(exist_ok=True)
 SNAP_DIR = Path("snapshots"); SNAP_DIR.mkdir(exist_ok=True)
-UA = {"User-Agent": "Mozilla/5.0 (compatible; mlb-screen/5.0)"}
+UA = {"User-Agent": "Mozilla/5.0 (compatible; mlb-screen/6.0)"}
 
-HFA = 0.035          # home-field advantage (win prob)
-EDGE_MIN = 0.03      # minimum model edge to flag
-PRIOR_G = 34         # games of .500 prior to regress team win% (heavier = less favorite-biased)
-XWOBA_SCALE = 1.0    # starter xwOBA gap -> win prob nudge (capped +/-0.08)
+HFA = 0.035
+EDGE_MIN = 0.03
+PRIOR_G = 34
+XWOBA_SCALE = 1.0
+ELITE_KBB = 16.0          # only pull Ks props for starters with K-BB% >= this
+PROPS_HOUR_UTC = 21       # only fetch props on/after this UTC hour (evening run)
+ODDS_BASE = "https://api.the-odds-api.com/v4/sports/baseball_mlb"
 
 VENUE_COORDS: dict[str, tuple[float, float]] = {
     "Yankee Stadium": (40.8296, -73.9262), "Fenway Park": (42.3467, -71.0972),
@@ -76,8 +76,26 @@ def implied(odds):
     return (-o / (-o + 100)) if o < 0 else (100 / (o + 100))
 
 
+def poisson_cdf(k, lam):
+    """P(X <= k) for Poisson(lam)."""
+    if lam <= 0 or k < 0:
+        return 1.0 if k >= 0 else 0.0
+    s, term = 0.0, math.exp(-lam)
+    for i in range(0, k + 1):
+        if i > 0:
+            term *= lam / i
+        s += term
+    return min(1.0, s)
+
+
+def over_prob(line, lam):
+    """P(strikeouts > line) for a .5 line."""
+    thr = math.floor(line) + 1
+    return max(0.0, 1.0 - poisson_cdf(thr - 1, lam))
+
+
 # ---------------------------------------------------------------------------
-# MLB Stats API: schedule, pitchers, standings
+# MLB Stats API
 # ---------------------------------------------------------------------------
 def fetch_schedule() -> list[dict]:
     url = "https://statsapi.mlb.com/api/v1/schedule"
@@ -115,12 +133,13 @@ def fetch_pitcher_season(pid) -> dict | None:
         bf = safe_float(s.get("battersFaced"))
         k = safe_float(s.get("strikeOuts"))
         bb = safe_float(s.get("baseOnBalls"))
+        gs = int(safe_float(s.get("gamesStarted"), 0))
+        ip = safe_float(s.get("inningsPitched"))
         kpct = (k / bf * 100) if bf else float("nan")
         bbpct = (bb / bf * 100) if bf else float("nan")
         return {
-            "GS": int(safe_float(s.get("gamesStarted"), 0)),
-            "ERA": safe_float(s.get("era")), "WHIP": safe_float(s.get("whip")),
-            "KBB_pct": (kpct - bbpct) if not math.isnan(kpct) else float("nan"),
+            "GS": gs, "IP": ip, "ERA": safe_float(s.get("era")), "WHIP": safe_float(s.get("whip")),
+            "K_pct": kpct, "KBB_pct": (kpct - bbpct) if not math.isnan(kpct) else float("nan"),
         }
     except Exception as e:
         print(f"[stats] pid {pid} failed: {e}", file=sys.stderr)
@@ -150,7 +169,6 @@ def fetch_savant_expected() -> dict[str, dict]:
     try:
         from pybaseball import statcast_pitcher_expected_stats
         df = statcast_pitcher_expected_stats(YEAR, 1)
-        print(f"[savant] columns: {list(df.columns)}", file=sys.stderr)
         for _, row in df.iterrows():
             pid = str(row.get("player_id", "")).strip()
             if not pid or pid.lower() == "nan":
@@ -168,22 +186,33 @@ def build_pitcher(pid, name, savant) -> dict | None:
     base = base or {}
     sv = savant.get(str(pid), {}) if pid else {}
     base["Name"] = name or "?"
+    base["pid"] = pid
     base["xwoba"] = sv.get("xwoba", float("nan"))
     base["woba"] = sv.get("woba", float("nan"))
     return base
 
 
+def expected_ks(p) -> float:
+    """Project a starter's strikeouts: K% * expected batters faced."""
+    kpct = p.get("K_pct", float("nan"))
+    if math.isnan(kpct):
+        return float("nan")
+    gs, ip = p.get("GS", 0), p.get("IP", float("nan"))
+    avg_ip = (ip / gs) if (gs and not math.isnan(ip)) else 5.5
+    exp_bf = max(18.0, min(28.0, avg_ip * 4.3))
+    return (kpct / 100.0) * exp_bf
+
+
 # ---------------------------------------------------------------------------
-# Odds + snapshots
+# Odds + snapshots + props
 # ---------------------------------------------------------------------------
 def fetch_odds() -> dict[str, dict]:
     if not ODDS_API_KEY:
         return {}
-    url = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
     params = {"apiKey": ODDS_API_KEY, "regions": "us", "markets": "h2h",
               "oddsFormat": "american", "bookmakers": "fanduel,draftkings"}
     try:
-        r = requests.get(url, params=params, timeout=20)
+        r = requests.get(f"{ODDS_BASE}/odds", params=params, timeout=20)
         r.raise_for_status()
     except Exception as e:
         print(f"[odds] failed: {e}", file=sys.stderr)
@@ -197,8 +226,43 @@ def fetch_odds() -> dict[str, dict]:
                     for o in m["outcomes"]:
                         ml.setdefault(o["name"], []).append(o["price"])
         ml_avg = {n: round(sum(p) / len(p)) for n, p in ml.items() if p}
-        result[f"{g.get('away_team')}@{g.get('home_team')}"] = {"ml": ml_avg}
+        result[f"{g.get('away_team')}@{g.get('home_team')}"] = {"ml": ml_avg, "event_id": g.get("id")}
     return result
+
+
+def fetch_strikeout_props(event_id) -> dict[str, dict]:
+    """Return {player_name: {line, over, under}} for pitcher_strikeouts in one event."""
+    if not ODDS_API_KEY or not event_id:
+        return {}
+    params = {"apiKey": ODDS_API_KEY, "regions": "us", "markets": "pitcher_strikeouts",
+              "oddsFormat": "american", "bookmakers": "fanduel,draftkings"}
+    try:
+        r = requests.get(f"{ODDS_BASE}/events/{event_id}/odds", params=params, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[props] event {event_id} failed: {e}", file=sys.stderr)
+        return {}
+    agg: dict[str, dict] = {}
+    for book in r.json().get("bookmakers", []):
+        for m in book.get("markets", []):
+            if m.get("key") != "pitcher_strikeouts":
+                continue
+            for o in m.get("outcomes", []):
+                name = o.get("description") or o.get("name")
+                side = o.get("name")
+                d = agg.setdefault(name, {"line": o.get("point"), "over": [], "under": []})
+                if side == "Over":
+                    d["over"].append(o["price"])
+                elif side == "Under":
+                    d["under"].append(o["price"])
+    out = {}
+    for name, d in agg.items():
+        out[name] = {
+            "line": d["line"],
+            "over": round(sum(d["over"]) / len(d["over"])) if d["over"] else None,
+            "under": round(sum(d["under"]) / len(d["under"])) if d["under"] else None,
+        }
+    return out
 
 
 def update_snapshots(odds) -> tuple[dict, int]:
@@ -241,7 +305,7 @@ def fetch_weather(lat, lon) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Win-probability model
+# Model
 # ---------------------------------------------------------------------------
 def regressed_winpct(w, l):
     g = w + l
@@ -258,17 +322,15 @@ def model_prob_home(game, away_p, home_p, standings):
     ha, aw = standings.get(game["home_team"]), standings.get(game["away_team"])
     if not ha or not aw:
         return None
-    p = log5(regressed_winpct(ha["w"], ha["l"]), regressed_winpct(aw["w"], aw["l"]))
-    p += HFA
+    p = log5(regressed_winpct(ha["w"], ha["l"]), regressed_winpct(aw["w"], aw["l"])) + HFA
     hx = home_p.get("xwoba") if home_p else float("nan")
     ax = away_p.get("xwoba") if away_p else float("nan")
     if not (math.isnan(hx) or math.isnan(ax)):
-        p += max(-0.08, min(0.08, (ax - hx) * XWOBA_SCALE))  # better (lower) home xwOBA -> home up
+        p += max(-0.08, min(0.08, (ax - hx) * XWOBA_SCALE))
     return max(0.05, min(0.95, p))
 
 
 def compute_edge(game, model_p_home):
-    """Return (value_team, edge, value_odds) using de-vigged market, or None."""
     ml = game.get("_ml", {})
     h, a = game["home_team"], game["away_team"]
     ih, ia = implied(ml.get(h)), implied(ml.get(a))
@@ -283,10 +345,46 @@ def compute_edge(game, model_p_home):
     return None
 
 
+def name_match(target, candidates):
+    if not target:
+        return None
+    t = target.lower().strip()
+    for c in candidates:
+        if c.lower().strip() == t:
+            return c
+    last = t.split()[-1]
+    for c in candidates:
+        if last in c.lower():
+            return c
+    return None
+
+
+def ks_edge(pitcher, props):
+    """Return dict with line, proj, over_price, model_p, edge for a starter, or None."""
+    if not pitcher:
+        return None
+    match = name_match(pitcher.get("Name"), list(props.keys()))
+    if not match:
+        return None
+    pr = props[match]
+    line, over = pr.get("line"), pr.get("over")
+    if line is None or over is None:
+        return None
+    proj = expected_ks(pitcher)
+    if math.isnan(proj):
+        return None
+    model_p = over_prob(line, proj)
+    io, iu = implied(over), implied(pr.get("under"))
+    fair_over = io / (io + iu) if (io and iu) else io
+    edge = model_p - fair_over if fair_over else None
+    return {"name": pitcher["Name"], "line": line, "over": over, "proj": proj,
+            "model_p": model_p, "edge": edge}
+
+
 # ---------------------------------------------------------------------------
 # Screen
 # ---------------------------------------------------------------------------
-def screen_game(game, savant, odds, opening, standings, weather, n_snaps) -> dict:
+def screen_game(game, savant, odds, opening, standings, weather, props_by_key, n_snaps) -> dict:
     away = build_pitcher(game["away_pid"], game["away_pitcher"], savant)
     home = build_pitcher(game["home_pid"], game["home_pitcher"], savant)
     eliminations, flags, reg_value_teams = [], [], set()
@@ -294,18 +392,6 @@ def screen_game(game, savant, odds, opening, standings, weather, n_snaps) -> dic
     game_odds = odds.get(key, {})
     game["_ml"] = game_odds.get("ml", {})
     mv = movement(key, game["_ml"], opening)
-
-    def mv_note(team):
-        if team not in mv:
-            return ""
-        op, cur, di = mv[team]
-        if op is None or di is None:
-            return ""
-        if di > 0.01:
-            return f" · ✅ mercado a favor ({op:+d}→{cur:+d}, {di:+.1%})"
-        if di < -0.01:
-            return f" · ⚠️ mercado EN CONTRA ({op:+d}→{cur:+d}, {di:+.1%})"
-        return f" · mercado estable ({op:+d}→{cur:+d})"
 
     for p, side in [(away, "visitante"), (home, "local")]:
         if not p:
@@ -348,9 +434,19 @@ def screen_game(game, savant, odds, opening, standings, weather, n_snaps) -> dic
     model_p = model_prob_home(game, away, home, standings)
     edge = compute_edge(game, model_p) if not eliminations else None
 
-    return {"game": game, "away": away, "home": home, "weather": weather,
-            "mv": mv, "mv_note": mv_note, "eliminations": eliminations, "flags": flags,
-            "model_p": model_p, "edge": edge, "reg_value_teams": reg_value_teams}
+    # Strikeout props for elite-K starters
+    ks = []
+    if not eliminations:
+        props = props_by_key.get(key, {})
+        for p in (away, home):
+            if p and not math.isnan(p.get("KBB_pct", float("nan"))) and p["KBB_pct"] >= ELITE_KBB:
+                ke = ks_edge(p, props)
+                if ke:
+                    ks.append(ke)
+
+    return {"game": game, "away": away, "home": home, "weather": weather, "mv": mv,
+            "eliminations": eliminations, "flags": flags, "model_p": model_p, "edge": edge,
+            "reg_value_teams": reg_value_teams, "ks": ks}
 
 
 def pline(p, label) -> str:
@@ -373,28 +469,45 @@ def ml_line(mv) -> str:
     return " · ".join(parts)
 
 
-def build_report(screens, n_snaps) -> str:
-    snap_note = (f"Snapshot #{n_snaps}; movimiento desde la apertura."
-                 if n_snaps > 1 else "1ª corrida del día (apertura registrada).")
+def build_report(screens, n_snaps, props_pulled) -> str:
+    snap_note = (f"Snapshot #{n_snaps}; movimiento desde apertura."
+                 if n_snaps > 1 else "1ª corrida del día.")
+    props_note = ("Props de ponches: evaluados (corrida pre-juego)." if props_pulled
+                  else "Props de ponches: se evalúan en la corrida pre-juego (tarde).")
     L = [f"# Screen MLB — {TODAY}", "",
          f"**Juegos:** {len(screens)} · "
          f"**Eliminados:** {sum(1 for s in screens if s['eliminations'])} · "
          f"**Con flags:** {sum(1 for s in screens if s['flags'] and not s['eliminations'])}",
-         "", f"_Modelo log5+xwOBA+localía vs línea sin vig. {snap_note}_", "", "---", ""]
+         "", f"_Modelo log5+xwOBA+localía vs línea sin vig. {snap_note} {props_note}_", "", "---", ""]
 
-    # TOP: model edges
-    edges = [s for s in screens if s.get("edge")]
-    edges.sort(key=lambda s: s["edge"][1], reverse=True)
-    L += ["## ✅ Edge del modelo (≥ +3%)", ""]
+    # Model ML edges
+    edges = sorted([s for s in screens if s.get("edge")], key=lambda s: s["edge"][1], reverse=True)
+    L += ["## ✅ Edge del modelo — Moneyline (≥ +3%)", ""]
     if not edges:
-        L.append("_Ningún lado supera +3% hoy — pizarrón eficiente. No-play es válido._")
+        L.append("_Ningún ML supera +3% — pizarrón eficiente._")
     for s in edges:
         team, edge, odds = s["edge"]
+        double = " 🟢 **DOBLE SEÑAL**" if team in s["reg_value_teams"] else ""
+        warn = "  ⚠️ edge alto, sospecha" if edge > 0.08 else ""
         g = s["game"]
-        double = " 🟢 **DOBLE SEÑAL** (modelo + regresión coinciden)" if team in s["reg_value_teams"] else ""
-        warn = "  ⚠️ edge alto, sospecha (revisa lesiones/lineup)" if edge > 0.08 else ""
-        L.append(f"- **{team} ML {odds:+d}** — edge **{edge:+.1%}**{s['mv_note'](team)}{double}{warn}")
-        L.append(f"  _{g['away_team']} @ {g['home_team']}_")
+        L.append(f"- **{team} ML {odds:+d}** — edge **{edge:+.1%}**{double}{warn}  _({g['away_team']} @ {g['home_team']})_")
+    L.append("")
+
+    # Strikeout prop edges
+    ks_all = [(s, k) for s in screens for k in s.get("ks", [])]
+    L += ["## 🎯 Ponches — candidatos élite", ""]
+    if not props_pulled:
+        L.append("_Se evalúan en la corrida pre-juego (tarde)._")
+    elif not ks_all:
+        L.append("_Sin candidatos élite con línea hoy._")
+    else:
+        ks_all.sort(key=lambda x: (x[1]["edge"] if x[1]["edge"] is not None else -1), reverse=True)
+        for s, k in ks_all:
+            e = k["edge"]
+            tag = " ✅" if (e is not None and e >= EDGE_MIN) else ""
+            estr = f"{e:+.1%}" if e is not None else "n/d"
+            L.append(f"- **{k['name']} Over {k['line']} K ({k['over']:+d})** — proyección {k['proj']:.1f} K · "
+                     f"edge **{estr}**{tag}")
     L += ["", "---", ""]
 
     elim = [s for s in screens if s["eliminations"]]
@@ -430,33 +543,45 @@ def build_report(screens, n_snaps) -> str:
                 L.append(f"- Movimiento ML: {ml_line(s['mv'])}")
             L.append("")
 
-    L += ["---", "", "_El modelo es una brújula, no un oráculo: edges 3-6% son la zona accionable; "
-          ">8% suele significar que falta info (lesión/bullpen/lineup) que el mercado ya tiene. "
-          "Doble señal = mayor confianza. ≤3% del bankroll por parlay; registra el CLV._"]
+    L += ["---", "", "_Modelo y proyección son brújulas, no oráculos. Edges 3-6% accionables; "
+          ">8% sospecha. Doble señal = más confianza. ≤3% del bankroll por parlay; registra el CLV._"]
     return "\n".join(L)
 
 
 def main():
-    print(f"[screen] {TODAY}")
+    print(f"[screen] {TODAY} hour={NOW.hour}")
     games = fetch_schedule()
     print(f"[screen] {len(games)} games")
     if not games:
         (REPORTS_DIR / f"{TODAY}.md").write_text(f"# Screen MLB — {TODAY}\n\nSin juegos hoy.\n")
         return
     savant = fetch_savant_expected()
-    print(f"[screen] savant rows: {len(savant)}")
     standings = fetch_standings()
-    print(f"[screen] standings teams: {len(standings)}")
     odds = fetch_odds()
-    print(f"[screen] odds matchups: {len(odds)}")
     opening, n_snaps = update_snapshots(odds)
-    print(f"[screen] snapshot #{n_snaps}")
+    print(f"[screen] savant={len(savant)} standings={len(standings)} odds={len(odds)} snap#{n_snaps}")
+
+    # Build pitchers first to know who is elite-K, then pull props only for those games (quota-safe)
+    props_pulled = NOW.hour >= PROPS_HOUR_UTC
+    props_by_key = {}
+    if props_pulled:
+        for g in games:
+            ap = build_pitcher(g["away_pid"], g["away_pitcher"], savant)
+            hp = build_pitcher(g["home_pid"], g["home_pitcher"], savant)
+            elite = any(p and not math.isnan(p.get("KBB_pct", float("nan"))) and p["KBB_pct"] >= ELITE_KBB
+                        for p in (ap, hp))
+            key = f"{g['away_team']}@{g['home_team']}"
+            eid = odds.get(key, {}).get("event_id")
+            if elite and eid:
+                props_by_key[key] = fetch_strikeout_props(eid)
+        print(f"[screen] props pulled for {len(props_by_key)} elite-K games")
+
     screens = []
     for g in games:
         coords = VENUE_COORDS.get(g["venue"])
         weather = fetch_weather(*coords) if coords else {}
-        screens.append(screen_game(g, savant, odds, opening, standings, weather, n_snaps))
-    (REPORTS_DIR / f"{TODAY}.md").write_text(build_report(screens, n_snaps))
+        screens.append(screen_game(g, savant, odds, opening, standings, weather, props_by_key, n_snaps))
+    (REPORTS_DIR / f"{TODAY}.md").write_text(build_report(screens, n_snaps, props_pulled))
     print("[screen] wrote report")
 
 
