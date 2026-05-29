@@ -1,15 +1,21 @@
 """
-MLB Daily Screen (v4) — adds automatic line-movement tracking.
+MLB Daily Screen (v5) — adds a transparent win-probability model + auto edge.
 
-Data sources (all accessible from cloud / GitHub Actions IPs):
-  - statsapi.mlb.com         : schedule, probable pitchers, per-pitcher season stats
-  - Baseball Savant via pybaseball.statcast_pitcher_expected_stats : xwOBA / wOBA
-  - The Odds API             : moneyline (needs ODDS_API_KEY secret)
-  - Open-Meteo               : weather by stadium
+Pipeline:
+  1. Schedule + probable pitchers + per-pitcher stats : statsapi.mlb.com
+  2. Expected stats (xwOBA / wOBA)                     : Baseball Savant (pybaseball)
+  3. Standings (team strength)                         : statsapi.mlb.com
+  4. Moneylines + line-movement snapshots              : The Odds API
+  5. Weather                                           : Open-Meteo
 
-Line movement: each run appends current odds to snapshots/YYYY-MM-DD.json and
-compares against the first snapshot of the day (the "open"). Run the workflow
-2-3x/day so movement accrues. Writes reports/YYYY-MM-DD.md
+Model: log5(team win% regressed to .500) + home-field + starter xwOBA edge.
+Edge  = model prob  -  de-vigged market prob.  Flag if >= +3%.
+
+HONEST NOTE: the MLB market is very efficient. Small edges (3-6%) are the
+actionable zone; treat edges > 8% with suspicion (the model is likely missing
+info the market has: injuries, bullpen, lineup). Calibrate against your CLV log.
+
+Writes reports/YYYY-MM-DD.md ; snapshots in snapshots/YYYY-MM-DD.json
 """
 from __future__ import annotations
 import os
@@ -28,7 +34,12 @@ TODAY = NOW.strftime("%Y-%m-%d")
 YEAR = NOW.year
 REPORTS_DIR = Path("reports"); REPORTS_DIR.mkdir(exist_ok=True)
 SNAP_DIR = Path("snapshots"); SNAP_DIR.mkdir(exist_ok=True)
-UA = {"User-Agent": "Mozilla/5.0 (compatible; mlb-screen/4.0)"}
+UA = {"User-Agent": "Mozilla/5.0 (compatible; mlb-screen/5.0)"}
+
+HFA = 0.035          # home-field advantage (win prob)
+EDGE_MIN = 0.03      # minimum model edge to flag
+PRIOR_G = 34         # games of .500 prior to regress team win% (heavier = less favorite-biased)
+XWOBA_SCALE = 1.0    # starter xwOBA gap -> win prob nudge (capped +/-0.08)
 
 VENUE_COORDS: dict[str, tuple[float, float]] = {
     "Yankee Stadium": (40.8296, -73.9262), "Fenway Park": (42.3467, -71.0972),
@@ -66,7 +77,7 @@ def implied(odds):
 
 
 # ---------------------------------------------------------------------------
-# MLB Stats API
+# MLB Stats API: schedule, pitchers, standings
 # ---------------------------------------------------------------------------
 def fetch_schedule() -> list[dict]:
     url = "https://statsapi.mlb.com/api/v1/schedule"
@@ -116,8 +127,23 @@ def fetch_pitcher_season(pid) -> dict | None:
         return None
 
 
+def fetch_standings() -> dict[str, dict]:
+    url = "https://statsapi.mlb.com/api/v1/standings"
+    params = {"leagueId": "103,104", "season": YEAR, "standingsTypes": "regularSeason"}
+    out = {}
+    try:
+        r = requests.get(url, params=params, headers=UA, timeout=20)
+        r.raise_for_status()
+        for rec in r.json().get("records", []):
+            for tr in rec.get("teamRecords", []):
+                out[tr["team"]["name"]] = {"w": tr.get("wins", 0), "l": tr.get("losses", 0)}
+    except Exception as e:
+        print(f"[standings] failed: {e}", file=sys.stderr)
+    return out
+
+
 # ---------------------------------------------------------------------------
-# Baseball Savant via pybaseball
+# Savant
 # ---------------------------------------------------------------------------
 def fetch_savant_expected() -> dict[str, dict]:
     out: dict[str, dict] = {}
@@ -148,7 +174,7 @@ def build_pitcher(pid, name, savant) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Odds + line-movement snapshots
+# Odds + snapshots
 # ---------------------------------------------------------------------------
 def fetch_odds() -> dict[str, dict]:
     if not ODDS_API_KEY:
@@ -176,7 +202,6 @@ def fetch_odds() -> dict[str, dict]:
 
 
 def update_snapshots(odds) -> tuple[dict, int]:
-    """Append current ML to today's snapshot file; return (opening_odds, n_snapshots)."""
     path = SNAP_DIR / f"{TODAY}.json"
     history = []
     if path.exists():
@@ -184,16 +209,13 @@ def update_snapshots(odds) -> tuple[dict, int]:
             history = json.loads(path.read_text())
         except Exception:
             history = []
-    snap = {"ts": NOW.isoformat(timespec="minutes"),
-            "ml": {k: v.get("ml", {}) for k, v in odds.items()}}
-    history.append(snap)
+    history.append({"ts": NOW.isoformat(timespec="minutes"),
+                    "ml": {k: v.get("ml", {}) for k, v in odds.items()}})
     path.write_text(json.dumps(history))
-    opening = history[0]["ml"] if history else {}
-    return opening, len(history)
+    return (history[0]["ml"] if history else {}), len(history)
 
 
 def movement(key, current_ml, opening) -> dict:
-    """team -> (open_price, cur_price, delta_implied)."""
     open_ml = opening.get(key, {})
     out = {}
     for team, cur in current_ml.items():
@@ -219,28 +241,71 @@ def fetch_weather(lat, lon) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Win-probability model
+# ---------------------------------------------------------------------------
+def regressed_winpct(w, l):
+    g = w + l
+    return 0.5 if g <= 0 else (w + PRIOR_G / 2) / (g + PRIOR_G)
+
+
+def log5(pa, pb):
+    num = pa * (1 - pb)
+    den = pa * (1 - pb) + pb * (1 - pa)
+    return 0.5 if den == 0 else num / den
+
+
+def model_prob_home(game, away_p, home_p, standings):
+    ha, aw = standings.get(game["home_team"]), standings.get(game["away_team"])
+    if not ha or not aw:
+        return None
+    p = log5(regressed_winpct(ha["w"], ha["l"]), regressed_winpct(aw["w"], aw["l"]))
+    p += HFA
+    hx = home_p.get("xwoba") if home_p else float("nan")
+    ax = away_p.get("xwoba") if away_p else float("nan")
+    if not (math.isnan(hx) or math.isnan(ax)):
+        p += max(-0.08, min(0.08, (ax - hx) * XWOBA_SCALE))  # better (lower) home xwOBA -> home up
+    return max(0.05, min(0.95, p))
+
+
+def compute_edge(game, model_p_home):
+    """Return (value_team, edge, value_odds) using de-vigged market, or None."""
+    ml = game.get("_ml", {})
+    h, a = game["home_team"], game["away_team"]
+    ih, ia = implied(ml.get(h)), implied(ml.get(a))
+    if model_p_home is None or ih is None or ia is None:
+        return None
+    fair_h = ih / (ih + ia)
+    edge_h = model_p_home - fair_h
+    if edge_h >= EDGE_MIN:
+        return (h, edge_h, ml.get(h))
+    if -edge_h >= EDGE_MIN:
+        return (a, -edge_h, ml.get(a))
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Screen
 # ---------------------------------------------------------------------------
-def screen_game(game, savant, odds, opening, weather, n_snaps) -> dict:
+def screen_game(game, savant, odds, opening, standings, weather, n_snaps) -> dict:
     away = build_pitcher(game["away_pid"], game["away_pitcher"], savant)
     home = build_pitcher(game["home_pid"], game["home_pitcher"], savant)
-    eliminations, flags = [], []
+    eliminations, flags, reg_value_teams = [], [], set()
     key = f"{game['away_team']}@{game['home_team']}"
     game_odds = odds.get(key, {})
-    mv = movement(key, game_odds.get("ml", {}), opening)
+    game["_ml"] = game_odds.get("ml", {})
+    mv = movement(key, game["_ml"], opening)
 
-    def market_note(value_team):
-        """Direction of line movement for the side we think has value."""
-        if value_team not in mv:
+    def mv_note(team):
+        if team not in mv:
             return ""
-        op, cur, di = mv[value_team]
+        op, cur, di = mv[team]
         if op is None or di is None:
-            return "  · (sin apertura previa para comparar)"
+            return ""
         if di > 0.01:
-            return f"  · ✅ mercado A FAVOR: {value_team} {op:+d}→{cur:+d} ({di:+.1%})"
+            return f" · ✅ mercado a favor ({op:+d}→{cur:+d}, {di:+.1%})"
         if di < -0.01:
-            return f"  · ⚠️ mercado EN CONTRA: {value_team} {op:+d}→{cur:+d} ({di:+.1%}) — bandera amarilla"
-        return f"  · mercado estable ({value_team} {op:+d}→{cur:+d})"
+            return f" · ⚠️ mercado EN CONTRA ({op:+d}→{cur:+d}, {di:+.1%})"
+        return f" · mercado estable ({op:+d}→{cur:+d})"
 
     for p, side in [(away, "visitante"), (home, "local")]:
         if not p:
@@ -265,27 +330,27 @@ def screen_game(game, savant, odds, opening, weather, n_snaps) -> dict:
         if math.isnan(wo) or math.isnan(xwo):
             continue
         gap = xwo - wo
-        value_team = game["home_team"] if side == "visitante" else game["away_team"]  # fade -> opponent
-        own_team = game["away_team"] if side == "visitante" else game["home_team"]
+        opp = game["home_team"] if side == "visitante" else game["away_team"]
+        own = game["away_team"] if side == "visitante" else game["home_team"]
         if gap > 0.030:
-            note = market_note(value_team) if n_snaps > 1 else ""
-            flags.append(
-                f"🔻 {p['Name']} ({side}) sobreperforma: wOBA {wo:.3f} vs xwOBA {xwo:.3f} "
-                f"(gap {gap:+.3f}) → valor en {value_team}{note}"
-            )
+            reg_value_teams.add(opp)
+            flags.append(f"🔻 {p['Name']} ({side}) sobreperforma: wOBA {wo:.3f} vs xwOBA {xwo:.3f} "
+                         f"(gap {gap:+.3f}) → valor en {opp}")
         elif gap < -0.030:
-            note = market_note(own_team) if n_snaps > 1 else ""
-            flags.append(
-                f"🔺 {p['Name']} ({side}) subperforma: wOBA {wo:.3f} vs xwOBA {xwo:.3f} "
-                f"(gap {gap:+.3f}) → posible valor en {own_team}{note}"
-            )
+            reg_value_teams.add(own)
+            flags.append(f"🔺 {p['Name']} ({side}) subperforma: wOBA {wo:.3f} vs xwOBA {xwo:.3f} "
+                         f"(gap {gap:+.3f}) → posible valor en {own}")
 
-    for team, price in game_odds.get("ml", {}).items():
+    for team, price in game["_ml"].items():
         if price <= -200:
-            eliminations.append(f"{team} ML {price:+d} (favorito >-200, viola regla de armado)")
+            eliminations.append(f"{team} ML {price:+d} (favorito >-200)")
+
+    model_p = model_prob_home(game, away, home, standings)
+    edge = compute_edge(game, model_p) if not eliminations else None
 
     return {"game": game, "away": away, "home": home, "weather": weather,
-            "odds": game_odds, "mv": mv, "eliminations": eliminations, "flags": flags}
+            "mv": mv, "mv_note": mv_note, "eliminations": eliminations, "flags": flags,
+            "model_p": model_p, "edge": edge, "reg_value_teams": reg_value_teams}
 
 
 def pline(p, label) -> str:
@@ -303,46 +368,55 @@ def ml_line(mv) -> str:
     for team, (op, cur, di) in mv.items():
         if cur is None:
             continue
-        if op is not None and di is not None:
-            parts.append(f"{team} {op:+d}→{cur:+d} ({di:+.1%})")
-        else:
-            parts.append(f"{team} {cur:+d}")
+        parts.append(f"{team} {op:+d}→{cur:+d} ({di:+.1%})" if (op is not None and di is not None)
+                     else f"{team} {cur:+d}")
     return " · ".join(parts)
 
 
 def build_report(screens, n_snaps) -> str:
-    snap_note = (f"Snapshot #{n_snaps} de hoy — movimiento medido desde la apertura."
-                 if n_snaps > 1 else "Primera corrida del día (apertura registrada; el movimiento aparece en la 2ª corrida).")
+    snap_note = (f"Snapshot #{n_snaps}; movimiento desde la apertura."
+                 if n_snaps > 1 else "1ª corrida del día (apertura registrada).")
     L = [f"# Screen MLB — {TODAY}", "",
          f"**Juegos:** {len(screens)} · "
          f"**Eliminados:** {sum(1 for s in screens if s['eliminations'])} · "
          f"**Con flags:** {sum(1 for s in screens if s['flags'] and not s['eliminations'])}",
-         "", f"_Motor: wOBA vs xwOBA (Statcast). {snap_note}_", "", "---", ""]
+         "", f"_Modelo log5+xwOBA+localía vs línea sin vig. {snap_note}_", "", "---", ""]
+
+    # TOP: model edges
+    edges = [s for s in screens if s.get("edge")]
+    edges.sort(key=lambda s: s["edge"][1], reverse=True)
+    L += ["## ✅ Edge del modelo (≥ +3%)", ""]
+    if not edges:
+        L.append("_Ningún lado supera +3% hoy — pizarrón eficiente. No-play es válido._")
+    for s in edges:
+        team, edge, odds = s["edge"]
+        g = s["game"]
+        double = " 🟢 **DOBLE SEÑAL** (modelo + regresión coinciden)" if team in s["reg_value_teams"] else ""
+        warn = "  ⚠️ edge alto, sospecha (revisa lesiones/lineup)" if edge > 0.08 else ""
+        L.append(f"- **{team} ML {odds:+d}** — edge **{edge:+.1%}**{s['mv_note'](team)}{double}{warn}")
+        L.append(f"  _{g['away_team']} @ {g['home_team']}_")
+    L += ["", "---", ""]
 
     elim = [s for s in screens if s["eliminations"]]
     if elim:
         L += ["## 🚫 Eliminados", ""]
         for s in elim:
             g = s["game"]
-            L.append(f"**{g['away_team']} @ {g['home_team']}** ({g['venue']}):")
-            L += [f"  - {e}" for e in s["eliminations"]]
-            L.append("")
+            L.append(f"**{g['away_team']} @ {g['home_team']}**: " + "; ".join(s["eliminations"]))
+        L.append("")
 
     flagged = [s for s in screens if s["flags"] and not s["eliminations"]]
     if flagged:
         L += ["## ⚡ Candidatos con flags", ""]
         for s in flagged:
             g = s["game"]
-            L += [f"### {g['away_team']} @ {g['home_team']}", f"_{g['venue']}_", "",
+            mp = s["model_p"]
+            mp_str = f" · Modelo: {g['home_team']} {mp:.0%}" if mp is not None else ""
+            L += [f"### {g['away_team']} @ {g['home_team']}", f"_{g['venue']}_{mp_str}", "",
                   pline(s["away"], "Visitante:"), pline(s["home"], "Local:"), ""]
             L += [f"- {f}" for f in s["flags"]]
             if s["mv"]:
                 L.append(f"- Movimiento ML: {ml_line(s['mv'])}")
-            w = s["weather"]
-            if w:
-                L.append(f"- Clima: {safe_float(w.get('temperature_2m')):.0f}°F, "
-                         f"viento {safe_float(w.get('wind_speed_10m')):.1f} mph, "
-                         f"lluvia {safe_float(w.get('precipitation_probability')):.0f}%")
             L.append("")
 
     other = [s for s in screens if not s["flags"] and not s["eliminations"]]
@@ -356,8 +430,9 @@ def build_report(screens, n_snaps) -> str:
                 L.append(f"- Movimiento ML: {ml_line(s['mv'])}")
             L.append("")
 
-    L += ["---", "", "_Edge final = tu juicio. ≤3% del bankroll por parlay; registra el CLV. "
-          "Si el mercado se mueve EN CONTRA de una jugada flagueada, bájale convicción (lección Texas)._"]
+    L += ["---", "", "_El modelo es una brújula, no un oráculo: edges 3-6% son la zona accionable; "
+          ">8% suele significar que falta info (lesión/bullpen/lineup) que el mercado ya tiene. "
+          "Doble señal = mayor confianza. ≤3% del bankroll por parlay; registra el CLV._"]
     return "\n".join(L)
 
 
@@ -370,6 +445,8 @@ def main():
         return
     savant = fetch_savant_expected()
     print(f"[screen] savant rows: {len(savant)}")
+    standings = fetch_standings()
+    print(f"[screen] standings teams: {len(standings)}")
     odds = fetch_odds()
     print(f"[screen] odds matchups: {len(odds)}")
     opening, n_snaps = update_snapshots(odds)
@@ -378,9 +455,9 @@ def main():
     for g in games:
         coords = VENUE_COORDS.get(g["venue"])
         weather = fetch_weather(*coords) if coords else {}
-        screens.append(screen_game(g, savant, odds, opening, weather, n_snaps))
+        screens.append(screen_game(g, savant, odds, opening, standings, weather, n_snaps))
     (REPORTS_DIR / f"{TODAY}.md").write_text(build_report(screens, n_snaps))
-    print(f"[screen] wrote report")
+    print("[screen] wrote report")
 
 
 if __name__ == "__main__":
