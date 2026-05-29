@@ -1,17 +1,20 @@
 """
-MLB Daily Screen (v3) — no FanGraphs dependency.
+MLB Daily Screen (v4) — adds automatic line-movement tracking.
 
 Data sources (all accessible from cloud / GitHub Actions IPs):
   - statsapi.mlb.com         : schedule, probable pitchers, per-pitcher season stats
-  - Baseball Savant via pybaseball.statcast_pitcher_expected_stats : xwOBA / wOBA (regression engine)
+  - Baseball Savant via pybaseball.statcast_pitcher_expected_stats : xwOBA / wOBA
   - The Odds API             : moneyline (needs ODDS_API_KEY secret)
   - Open-Meteo               : weather by stadium
 
-Writes reports/YYYY-MM-DD.md
+Line movement: each run appends current odds to snapshots/YYYY-MM-DD.json and
+compares against the first snapshot of the day (the "open"). Run the workflow
+2-3x/day so movement accrues. Writes reports/YYYY-MM-DD.md
 """
 from __future__ import annotations
 import os
 import sys
+import json
 import math
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,9 +26,9 @@ ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "").strip()
 NOW = datetime.now(timezone.utc).astimezone()
 TODAY = NOW.strftime("%Y-%m-%d")
 YEAR = NOW.year
-REPORTS_DIR = Path("reports")
-REPORTS_DIR.mkdir(exist_ok=True)
-UA = {"User-Agent": "Mozilla/5.0 (compatible; mlb-screen/3.0)"}
+REPORTS_DIR = Path("reports"); REPORTS_DIR.mkdir(exist_ok=True)
+SNAP_DIR = Path("snapshots"); SNAP_DIR.mkdir(exist_ok=True)
+UA = {"User-Agent": "Mozilla/5.0 (compatible; mlb-screen/4.0)"}
 
 VENUE_COORDS: dict[str, tuple[float, float]] = {
     "Yankee Stadium": (40.8296, -73.9262), "Fenway Park": (42.3467, -71.0972),
@@ -55,6 +58,13 @@ def safe_float(v, default=float("nan")):
         return default
 
 
+def implied(odds):
+    o = safe_float(odds)
+    if math.isnan(o):
+        return None
+    return (-o / (-o + 100)) if o < 0 else (100 / (o + 100))
+
+
 # ---------------------------------------------------------------------------
 # MLB Stats API
 # ---------------------------------------------------------------------------
@@ -70,20 +80,15 @@ def fetch_schedule() -> list[dict]:
             ap = away.get("probablePitcher") or {}
             hp = home.get("probablePitcher") or {}
             games.append({
-                "gameTime": g.get("gameDate", ""),
-                "away_team": away["team"]["name"],
-                "home_team": home["team"]["name"],
-                "away_pitcher": ap.get("fullName"),
-                "away_pid": ap.get("id"),
-                "home_pitcher": hp.get("fullName"),
-                "home_pid": hp.get("id"),
+                "away_team": away["team"]["name"], "home_team": home["team"]["name"],
+                "away_pitcher": ap.get("fullName"), "away_pid": ap.get("id"),
+                "home_pitcher": hp.get("fullName"), "home_pid": hp.get("id"),
                 "venue": g["venue"]["name"],
             })
     return games
 
 
 def fetch_pitcher_season(pid) -> dict | None:
-    """Traditional season stats for one pitcher, by MLBAM id."""
     if not pid:
         return None
     url = f"https://statsapi.mlb.com/api/v1/people/{pid}"
@@ -103,11 +108,7 @@ def fetch_pitcher_season(pid) -> dict | None:
         bbpct = (bb / bf * 100) if bf else float("nan")
         return {
             "GS": int(safe_float(s.get("gamesStarted"), 0)),
-            "IP": s.get("inningsPitched", "?"),
-            "ERA": safe_float(s.get("era")),
-            "WHIP": safe_float(s.get("whip")),
-            "K_pct": kpct,
-            "BB_pct": bbpct,
+            "ERA": safe_float(s.get("era")), "WHIP": safe_float(s.get("whip")),
             "KBB_pct": (kpct - bbpct) if not math.isnan(kpct) else float("nan"),
         }
     except Exception as e:
@@ -116,23 +117,19 @@ def fetch_pitcher_season(pid) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Baseball Savant — expected stats via pybaseball (regression engine)
+# Baseball Savant via pybaseball
 # ---------------------------------------------------------------------------
 def fetch_savant_expected() -> dict[str, dict]:
-    """Returns {player_id(str): {woba, xwoba}} from Savant expected stats."""
     out: dict[str, dict] = {}
     try:
         from pybaseball import statcast_pitcher_expected_stats
-        df = statcast_pitcher_expected_stats(YEAR, 1)  # minPA=1 -> everyone
+        df = statcast_pitcher_expected_stats(YEAR, 1)
         print(f"[savant] columns: {list(df.columns)}", file=sys.stderr)
         for _, row in df.iterrows():
             pid = str(row.get("player_id", "")).strip()
             if not pid or pid.lower() == "nan":
                 continue
-            out[pid] = {
-                "woba": safe_float(row.get("woba")),
-                "xwoba": safe_float(row.get("est_woba")),
-            }
+            out[pid] = {"woba": safe_float(row.get("woba")), "xwoba": safe_float(row.get("est_woba"))}
     except Exception as e:
         print(f"[savant] failed: {e}", file=sys.stderr)
     return out
@@ -151,7 +148,7 @@ def build_pitcher(pid, name, savant) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Odds + weather
+# Odds + line-movement snapshots
 # ---------------------------------------------------------------------------
 def fetch_odds() -> dict[str, dict]:
     if not ODDS_API_KEY:
@@ -173,9 +170,39 @@ def fetch_odds() -> dict[str, dict]:
                 if m["key"] == "h2h":
                     for o in m["outcomes"]:
                         ml.setdefault(o["name"], []).append(o["price"])
-        ml_avg = {n: sum(p) / len(p) for n, p in ml.items() if p}
+        ml_avg = {n: round(sum(p) / len(p)) for n, p in ml.items() if p}
         result[f"{g.get('away_team')}@{g.get('home_team')}"] = {"ml": ml_avg}
     return result
+
+
+def update_snapshots(odds) -> tuple[dict, int]:
+    """Append current ML to today's snapshot file; return (opening_odds, n_snapshots)."""
+    path = SNAP_DIR / f"{TODAY}.json"
+    history = []
+    if path.exists():
+        try:
+            history = json.loads(path.read_text())
+        except Exception:
+            history = []
+    snap = {"ts": NOW.isoformat(timespec="minutes"),
+            "ml": {k: v.get("ml", {}) for k, v in odds.items()}}
+    history.append(snap)
+    path.write_text(json.dumps(history))
+    opening = history[0]["ml"] if history else {}
+    return opening, len(history)
+
+
+def movement(key, current_ml, opening) -> dict:
+    """team -> (open_price, cur_price, delta_implied)."""
+    open_ml = opening.get(key, {})
+    out = {}
+    for team, cur in current_ml.items():
+        op = open_ml.get(team)
+        di = None
+        if op is not None and implied(cur) is not None and implied(op) is not None:
+            di = implied(cur) - implied(op)
+        out[team] = (op, cur, di)
+    return out
 
 
 def fetch_weather(lat, lon) -> dict:
@@ -194,10 +221,26 @@ def fetch_weather(lat, lon) -> dict:
 # ---------------------------------------------------------------------------
 # Screen
 # ---------------------------------------------------------------------------
-def screen_game(game, savant, odds, weather) -> dict:
+def screen_game(game, savant, odds, opening, weather, n_snaps) -> dict:
     away = build_pitcher(game["away_pid"], game["away_pitcher"], savant)
     home = build_pitcher(game["home_pid"], game["home_pitcher"], savant)
     eliminations, flags = [], []
+    key = f"{game['away_team']}@{game['home_team']}"
+    game_odds = odds.get(key, {})
+    mv = movement(key, game_odds.get("ml", {}), opening)
+
+    def market_note(value_team):
+        """Direction of line movement for the side we think has value."""
+        if value_team not in mv:
+            return ""
+        op, cur, di = mv[value_team]
+        if op is None or di is None:
+            return "  · (sin apertura previa para comparar)"
+        if di > 0.01:
+            return f"  · ✅ mercado A FAVOR: {value_team} {op:+d}→{cur:+d} ({di:+.1%})"
+        if di < -0.01:
+            return f"  · ⚠️ mercado EN CONTRA: {value_team} {op:+d}→{cur:+d} ({di:+.1%}) — bandera amarilla"
+        return f"  · mercado estable ({value_team} {op:+d}→{cur:+d})"
 
     for p, side in [(away, "visitante"), (home, "local")]:
         if not p:
@@ -215,32 +258,34 @@ def screen_game(game, savant, odds, weather) -> dict:
     if wind > 15:
         flags.append(f"⚠️ Viento {wind:.1f} mph (>15) — descartar totales/RL")
 
-    # Regression engine: wOBA vs xwOBA gap (Statcast)
     for p, side in [(away, "visitante"), (home, "local")]:
         if not p:
             continue
         wo, xwo = p.get("woba", float("nan")), p.get("xwoba", float("nan"))
         if math.isnan(wo) or math.isnan(xwo):
             continue
-        gap = xwo - wo  # positive => allowing harder contact than results show => lucky
+        gap = xwo - wo
+        value_team = game["home_team"] if side == "visitante" else game["away_team"]  # fade -> opponent
+        own_team = game["away_team"] if side == "visitante" else game["home_team"]
         if gap > 0.030:
+            note = market_note(value_team) if n_snaps > 1 else ""
             flags.append(
                 f"🔻 {p['Name']} ({side}) sobreperforma: wOBA {wo:.3f} vs xwOBA {xwo:.3f} "
-                f"(gap {gap:+.3f}) → regresión negativa probable; el lado contrario gana valor"
+                f"(gap {gap:+.3f}) → valor en {value_team}{note}"
             )
         elif gap < -0.030:
+            note = market_note(own_team) if n_snaps > 1 else ""
             flags.append(
                 f"🔺 {p['Name']} ({side}) subperforma: wOBA {wo:.3f} vs xwOBA {xwo:.3f} "
-                f"(gap {gap:+.3f}) → regresión positiva probable; su lado puede tener valor"
+                f"(gap {gap:+.3f}) → posible valor en {own_team}{note}"
             )
 
-    game_odds = odds.get(f"{game['away_team']}@{game['home_team']}", {})
     for team, price in game_odds.get("ml", {}).items():
         if price <= -200:
-            eliminations.append(f"{team} ML {price:+.0f} (favorito >-200, viola regla de armado)")
+            eliminations.append(f"{team} ML {price:+d} (favorito >-200, viola regla de armado)")
 
     return {"game": game, "away": away, "home": home, "weather": weather,
-            "odds": game_odds, "eliminations": eliminations, "flags": flags}
+            "odds": game_odds, "mv": mv, "eliminations": eliminations, "flags": flags}
 
 
 def pline(p, label) -> str:
@@ -249,16 +294,30 @@ def pline(p, label) -> str:
     def f(x, n=2):
         return "n/d" if (isinstance(x, float) and math.isnan(x)) else f"{x:.{n}f}"
     return (f"- **{label}** {p.get('Name','?')} ({p.get('GS','?')} GS): "
-            f"ERA {f(p.get('ERA'))} · WHIP {f(p.get('WHIP'))} · "
-            f"K-BB% {f(p.get('KBB_pct'),1)} · wOBA {f(p.get('woba'),3)} · xwOBA {f(p.get('xwoba'),3)}")
+            f"ERA {f(p.get('ERA'))} · WHIP {f(p.get('WHIP'))} · K-BB% {f(p.get('KBB_pct'),1)} · "
+            f"wOBA {f(p.get('woba'),3)} · xwOBA {f(p.get('xwoba'),3)}")
 
 
-def build_report(screens) -> str:
+def ml_line(mv) -> str:
+    parts = []
+    for team, (op, cur, di) in mv.items():
+        if cur is None:
+            continue
+        if op is not None and di is not None:
+            parts.append(f"{team} {op:+d}→{cur:+d} ({di:+.1%})")
+        else:
+            parts.append(f"{team} {cur:+d}")
+    return " · ".join(parts)
+
+
+def build_report(screens, n_snaps) -> str:
+    snap_note = (f"Snapshot #{n_snaps} de hoy — movimiento medido desde la apertura."
+                 if n_snaps > 1 else "Primera corrida del día (apertura registrada; el movimiento aparece en la 2ª corrida).")
     L = [f"# Screen MLB — {TODAY}", "",
          f"**Juegos:** {len(screens)} · "
          f"**Eliminados:** {sum(1 for s in screens if s['eliminations'])} · "
          f"**Con flags:** {sum(1 for s in screens if s['flags'] and not s['eliminations'])}",
-         "", "_Motor de regresión: wOBA real vs xwOBA esperado (Statcast vía pybaseball)._", "", "---", ""]
+         "", f"_Motor: wOBA vs xwOBA (Statcast). {snap_note}_", "", "---", ""]
 
     elim = [s for s in screens if s["eliminations"]]
     if elim:
@@ -277,9 +336,8 @@ def build_report(screens) -> str:
             L += [f"### {g['away_team']} @ {g['home_team']}", f"_{g['venue']}_", "",
                   pline(s["away"], "Visitante:"), pline(s["home"], "Local:"), ""]
             L += [f"- {f}" for f in s["flags"]]
-            ml = s["odds"].get("ml", {})
-            if ml:
-                L.append("- Líneas ML: " + " · ".join(f"{t} {p:+.0f}" for t, p in ml.items()))
+            if s["mv"]:
+                L.append(f"- Movimiento ML: {ml_line(s['mv'])}")
             w = s["weather"]
             if w:
                 L.append(f"- Clima: {safe_float(w.get('temperature_2m')):.0f}°F, "
@@ -293,10 +351,13 @@ def build_report(screens) -> str:
         for s in other:
             g = s["game"]
             L += [f"### {g['away_team']} @ {g['home_team']}",
-                  pline(s["away"], "Visitante:"), pline(s["home"], "Local:"), ""]
+                  pline(s["away"], "Visitante:"), pline(s["home"], "Local:")]
+            if s["mv"]:
+                L.append(f"- Movimiento ML: {ml_line(s['mv'])}")
+            L.append("")
 
-    L += ["---", "", "_La calibración del edge sigue requiriendo numberFire o tu juicio. "
-          "Varianza siempre presente; ≤3% del bankroll por parlay; registra el CLV._"]
+    L += ["---", "", "_Edge final = tu juicio. ≤3% del bankroll por parlay; registra el CLV. "
+          "Si el mercado se mueve EN CONTRA de una jugada flagueada, bájale convicción (lección Texas)._"]
     return "\n".join(L)
 
 
@@ -311,14 +372,15 @@ def main():
     print(f"[screen] savant rows: {len(savant)}")
     odds = fetch_odds()
     print(f"[screen] odds matchups: {len(odds)}")
+    opening, n_snaps = update_snapshots(odds)
+    print(f"[screen] snapshot #{n_snaps}")
     screens = []
     for g in games:
         coords = VENUE_COORDS.get(g["venue"])
         weather = fetch_weather(*coords) if coords else {}
-        screens.append(screen_game(g, savant, odds, weather))
-    out = REPORTS_DIR / f"{TODAY}.md"
-    out.write_text(build_report(screens))
-    print(f"[screen] wrote {out}")
+        screens.append(screen_game(g, savant, odds, opening, weather, n_snaps))
+    (REPORTS_DIR / f"{TODAY}.md").write_text(build_report(screens, n_snaps))
+    print(f"[screen] wrote report")
 
 
 if __name__ == "__main__":
