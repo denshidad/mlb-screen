@@ -2,9 +2,11 @@ name: Daily MLB Screen
 
 on:
   schedule:
-    # 14:00 UTC = 10:00 AM ET (ajusta si quieres otra hora)
+    # 3 corridas: apertura (10am ET), mediodia (3pm ET), pre-juego (6:30pm ET)
     - cron: '0 14 * * *'
-  workflow_dispatch:  # permite disparo manual desde GitHub mobile
+    - cron: '0 19 * * *'
+    - cron: '30 22 * * *'
+  workflow_dispatch:
 
 jobs:
   screen:
@@ -12,27 +14,20 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run screen
-        env:
+      - run: pip install -r requirements.txt
+      - env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: python screen.py
-
-      - name: Commit report
+      - name: Commit report + snapshots
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add reports/
-          git diff --cached --quiet || git commit -m "Screen $(date -u +%Y-%m-%d)"
+          git pull --rebase --autostash || true
+          git add reports/ snapshots/
+          git diff --cached --quiet || git commit -m "Screen $(date -u +%Y-%m-%dT%H:%MZ)"
           git push
