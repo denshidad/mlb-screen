@@ -2,10 +2,12 @@ name: Daily MLB Screen
 
 on:
   schedule:
-    # 3 corridas: apertura (10am ET), mediodia (3pm ET), pre-juego (6:30pm ET)
-    - cron: '0 14 * * *'
-    - cron: '0 19 * * *'
-    - cron: '30 22 * * *'
+    # 4 corridas cubren juegos de mediodia (domingos) y de noche.
+    # Las props se jalan solas en la ventana antes del PRIMER juego del dia.
+    - cron: '0 13 * * *'   # 9:00 AM ET
+    - cron: '0 15 * * *'   # 11:00 AM ET  (cubre domingos con juegos a las 12)
+    - cron: '0 17 * * *'   # 1:00 PM ET
+    - cron: '0 22 * * *'   # 6:00 PM ET   (cubre juegos de noche)
   workflow_dispatch:
 
 jobs:
