@@ -19,7 +19,7 @@ import os
 import sys
 import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
@@ -38,7 +38,7 @@ EDGE_MIN = 0.03
 PRIOR_G = 34
 XWOBA_SCALE = 1.0
 ELITE_KBB = 16.0          # only pull Ks props for starters with K-BB% >= this
-PROPS_HOUR_UTC = 21       # only fetch props on/after this UTC hour (evening run)
+PROPS_WINDOW_H = 4.0      # pull props within this many hours before the FIRST game (any day)
 ODDS_BASE = "https://api.the-odds-api.com/v4/sports/baseball_mlb"
 
 VENUE_COORDS: dict[str, tuple[float, float]] = {
@@ -112,9 +112,22 @@ def fetch_schedule() -> list[dict]:
                 "away_team": away["team"]["name"], "home_team": home["team"]["name"],
                 "away_pitcher": ap.get("fullName"), "away_pid": ap.get("id"),
                 "home_pitcher": hp.get("fullName"), "home_pid": hp.get("id"),
-                "venue": g["venue"]["name"],
+                "venue": g["venue"]["name"], "gameTime": g.get("gameDate"),
             })
     return games
+
+
+def earliest_start(games):
+    """Earliest first-pitch (aware UTC datetime) among today's games, or None."""
+    times = []
+    for g in games:
+        t = g.get("gameTime")
+        if t:
+            try:
+                times.append(datetime.fromisoformat(t.replace("Z", "+00:00")))
+            except Exception:
+                pass
+    return min(times) if times else None
 
 
 def fetch_pitcher_season(pid) -> dict | None:
@@ -285,7 +298,15 @@ def update_snapshots(odds) -> tuple[dict, int]:
     history.append({"ts": NOW.isoformat(timespec="minutes"),
                     "ml": {k: v.get("ml", {}) for k, v in odds.items()}})
     path.write_text(json.dumps(history))
-    return (history[0]["ml"] if history else {}), len(history)
+    # Clean opening: per game, the EARLIEST snapshot where both sides have valid odds
+    opening = {}
+    for snap in history:
+        for key, ml in snap.get("ml", {}).items():
+            if key in opening:
+                continue
+            if len(ml) >= 2 and all(implied(v) is not None for v in ml.values()):
+                opening[key] = ml
+    return opening, len(history)
 
 
 def movement(key, current_ml, opening) -> dict:
@@ -570,20 +591,36 @@ def main():
     opening, n_snaps = update_snapshots(odds)
     print(f"[screen] savant={len(savant)} standings={len(standings)} odds={len(odds)} snap#{n_snaps}")
 
-    # Build pitchers first to know who is elite-K, then pull props only for those games (quota-safe)
-    props_pulled = NOW.hour >= PROPS_HOUR_UTC
+    # --- Props: pull once/day within PROPS_WINDOW_H hours before the FIRST game ---
+    # Persist to a file so EVERY later run's report still shows them (and we don't re-pull).
+    props_path = SNAP_DIR / f"props_{TODAY}.json"
     props_by_key = {}
-    if props_pulled:
-        for g in games:
-            ap = build_pitcher(g["away_pid"], g["away_pitcher"], savant)
-            hp = build_pitcher(g["home_pid"], g["home_pitcher"], savant)
-            elite = any(p and not math.isnan(p.get("KBB_pct", float("nan"))) and p["KBB_pct"] >= ELITE_KBB
-                        for p in (ap, hp))
-            key = f"{g['away_team']}@{g['home_team']}"
-            eid = odds.get(key, {}).get("event_id")
-            if elite and eid:
-                props_by_key[key] = fetch_strikeout_props(eid)
-        print(f"[screen] props pulled for {len(props_by_key)} elite-K games")
+    props_pulled = False
+    if props_path.exists():
+        try:
+            props_by_key = json.loads(props_path.read_text())
+            props_pulled = True
+        except Exception:
+            props_by_key = {}
+    else:
+        es = earliest_start(games)
+        in_window = es is not None and NOW < es and (es - NOW) <= timedelta(hours=PROPS_WINDOW_H)
+        if in_window:
+            for g in games:
+                ap = build_pitcher(g["away_pid"], g["away_pitcher"], savant)
+                hp = build_pitcher(g["home_pid"], g["home_pitcher"], savant)
+                elite = any(p and not math.isnan(p.get("KBB_pct", float("nan"))) and p["KBB_pct"] >= ELITE_KBB
+                            for p in (ap, hp))
+                key = f"{g['away_team']}@{g['home_team']}"
+                eid = odds.get(key, {}).get("event_id")
+                if elite and eid:
+                    props_by_key[key] = fetch_strikeout_props(eid)
+            props_path.write_text(json.dumps(props_by_key))
+            props_pulled = True
+            print(f"[screen] props pulled for {len(props_by_key)} elite-K games (window before first pitch)")
+        else:
+            nxt = (es.isoformat() if es else "?")
+            print(f"[screen] props not yet (first pitch {nxt}); will pull within {PROPS_WINDOW_H}h before")
 
     screens = []
     for g in games:
