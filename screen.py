@@ -499,16 +499,53 @@ def ml_line(mv) -> str:
     return " · ".join(parts)
 
 
+def suggested_units(edge):
+    """Conservative unit sizing by edge tier; big edges capped (suspicion rule)."""
+    if edge > 0.08:
+        return 1.0   # suspect -> cap
+    if edge >= 0.06:
+        return 1.5
+    return 1.0       # 3-6%
+
+
+def daily_card(screens) -> list[str]:
+    """Decision-ready list of ONLY qualifying plays across all markets."""
+    plays = []
+    for s in screens:
+        if s.get("edge"):
+            team, edge, odds = s["edge"]
+            dbl = " 🟢DOBLE" if team in s["reg_value_teams"] else ""
+            plays.append((edge, f"{team} ML {odds:+d}", dbl))
+        for k in s.get("ks", []):
+            if k["edge"] is not None and k["edge"] >= EDGE_MIN:
+                plays.append((k["edge"], f"{k['name']} Over {k['line']} K ({k['over']:+d})", ""))
+    L = ["## 🎯 JUGADAS DEL DÍA", ""]
+    if not plays:
+        L += ["**HOY: NO-PLAY** — ningún mercado supera el umbral. Día de descanso (es válido y disciplinado).", ""]
+        return L
+    total = 0.0
+    for edge, txt, dbl in sorted(plays, key=lambda x: x[0], reverse=True):
+        u = suggested_units(edge)
+        total += u
+        sus = " ⚠️sospecha (revisa rival/innings)" if edge > 0.08 else ""
+        L.append(f"- **{txt}** — edge {edge:+.1%} → **{u:g}u** (${u*10:.0f}){dbl}{sus}")
+    L += ["", f"_Exposición total sugerida: {total:g}u (~${total*10:.0f}). "
+          f"Revisa matices (rival, límite de innings) antes de cerrar. Registra el CLV._", ""]
+    return L
+
+
 def build_report(screens, n_snaps, props_pulled) -> str:
     snap_note = (f"Snapshot #{n_snaps}; movimiento desde apertura."
                  if n_snaps > 1 else "1ª corrida del día.")
     props_note = ("Props de ponches: evaluados (corrida pre-juego)." if props_pulled
                   else "Props de ponches: se evalúan en la corrida pre-juego (tarde).")
-    L = [f"# Screen MLB — {TODAY}", "",
-         f"**Juegos:** {len(screens)} · "
-         f"**Eliminados:** {sum(1 for s in screens if s['eliminations'])} · "
-         f"**Con flags:** {sum(1 for s in screens if s['flags'] and not s['eliminations'])}",
-         "", f"_Modelo log5+xwOBA+localía vs línea sin vig. {snap_note} {props_note}_", "", "---", ""]
+    L = [f"# Screen MLB — {TODAY}", ""]
+    L += daily_card(screens)
+    L += ["---", "",
+          f"**Juegos:** {len(screens)} · "
+          f"**Eliminados:** {sum(1 for s in screens if s['eliminations'])} · "
+          f"**Con flags:** {sum(1 for s in screens if s['flags'] and not s['eliminations'])}",
+          "", f"_Detalle abajo. Modelo log5+xwOBA+localía vs línea sin vig. {snap_note} {props_note}_", "", "---", ""]
 
     # Model ML edges
     edges = sorted([s for s in screens if s.get("edge")], key=lambda s: s["edge"][1], reverse=True)
